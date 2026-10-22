@@ -122,6 +122,7 @@ async def _score_single_image(
     model_name: str,
     loop,
     session: aiohttp.ClientSession,
+    system_prompt: Optional[str] = None,
 ) -> tuple[float, float, str]:
     """Score one image frame against ``caption`` via UnifiedReward."""
     from verl_omni.utils.reward_score.reward_utils import pil_image_to_base64
@@ -137,6 +138,8 @@ async def _score_single_image(
             ],
         },
     ]
+    if system_prompt is not None:
+        messages.insert(0, {"role": "system", "content": system_prompt})
     chat_complete_request = {
         "messages": messages,
         "model": model_name,
@@ -163,12 +166,15 @@ async def compute_score_unified_reward(
     reward_router_address: str,
     reward_model_tokenizer: PreTrainedTokenizer = None,
     model_name: Optional[str] = None,
+    system_prompt: Optional[str] = None,
 ):
     """Compute a human-preference score via UnifiedReward 2.0.
 
     The reward model scores the generated image against its text caption on
     Alignment, Coherence, and Style axes. The returned ``score`` is the mean of
     those axes normalized from the model's 1-5 scale to ``[0, 1]``.
+    ``system_prompt``, when provided, is sent as a system message ahead of the
+    image prompt; when ``None``, no system message is sent.
     """
     from verl.utils.ray_utils import get_event_loop
 
@@ -193,6 +199,7 @@ async def compute_score_unified_reward(
                     model_name=model_name,
                     loop=loop,
                     session=session,
+                    system_prompt=system_prompt,
                 )
                 for image in solution_image
             ]

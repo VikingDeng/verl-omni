@@ -1,6 +1,6 @@
 # Named Reward Models
 
-Last updated: 10/13/2026
+Last updated: 10/22/2026
 
 This guide describes how to configure and extend named model-backed rewards
 under `reward.models` in `verl-omni`. For the general Reward Loop interface and
@@ -227,6 +227,23 @@ reward_functions:
     model: quality
     path: pkg://my_package.reward_score
     name: compute_semantic_quality
+```
+
+Scorer arguments set on a term are forwarded to that term's scorer, so terms
+can share one judge deployment while using different scorers and prompts:
+
+```yaml
+reward_functions:
+  ocr:
+    model: judge
+    path: pkg://verl_omni.utils.reward_score.genrm_ocr
+    name: compute_score_ocr
+    system_prompt: "Transcribe all text in the image exactly."
+  semantics:
+    model: judge
+    path: pkg://verl_omni.utils.reward_score.unified_reward
+    name: compute_score_unified_reward
+    system_prompt: "Rate how well the image matches the caption."
 ```
 
 Every term uses the existing aggregation contract:

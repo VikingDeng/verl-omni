@@ -378,6 +378,42 @@ class TestMultiRewardManagerRunSingle:
             else:
                 assert "seed" not in current
 
+    def test_genrm_ocr_system_prompt_is_per_reward_term(self, monkeypatch):
+        from verl_omni.utils.reward_score import genrm_ocr
+
+        requests = []
+
+        async def chat_complete(router_address, chat_complete_request):
+            requests.append(chat_complete_request)
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="hello"))])
+
+        monkeypatch.setattr(genrm_ocr, "_chat_complete", chat_complete)
+        config = _make_config(
+            {
+                "ocr_custom": {
+                    "model": "ocr_engine",
+                    "path": "pkg://verl_omni.utils.reward_score.genrm_ocr",
+                    "name": "compute_score_ocr",
+                    "system_prompt": "A",
+                },
+                "ocr_default": {
+                    "model": "ocr_engine",
+                    "path": "pkg://verl_omni.utils.reward_score.genrm_ocr",
+                    "name": "compute_score_ocr",
+                },
+            }
+        )
+        config.reward.models = OmegaConf.create({"ocr_engine": {"backend": "engine"}})
+        manager = MultiVisualRewardManager(config, MagicMock(), compute_score=None)
+        manager.set_reward_executors({"ocr_engine": _EngineRouterClient()}, None)
+
+        manager.loop.run_until_complete(manager.run_single(_make_single_data()))
+
+        assert [request["messages"][0]["content"] for request in requests] == [
+            "A",
+            "You are a helpful assistant.",
+        ]
+
     def test_named_engine_preserves_explicit_scorer_sampling_params(self):
         explicit = {"max_tokens": 7, "temperature": 0.2}
         config = _make_config(

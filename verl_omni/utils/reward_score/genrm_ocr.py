@@ -31,7 +31,6 @@ from openai.types.chat import ChatCompletion
 from PIL import Image
 from transformers import PreTrainedTokenizer
 
-DEFAULT_GRM_SYSTEM_PROMPT = "You are a helpful assistant."
 DEFAULT_GRM_PROMPT = (
     "Please output only the text content from the image without any additional descriptions or formatting."
 )
@@ -104,8 +103,7 @@ async def compute_score_ocr(
     model_name: Optional[str] = None,
     sampling_params: dict = None,
     *,
-    system_prompt: Optional[str] = None,
-    prompt: Optional[str] = None,
+    user_prompt: Optional[str] = None,
 ):
     """Compute an image OCR score via a generative reward model (GRM).
 
@@ -128,22 +126,28 @@ async def compute_score_ocr(
         sampling_params: Override the defaults from :func:`_sampling_params`.
             An explicit ``seed`` opts in to reproducible sampling; without one
             any env-inherited seed is dropped.
-        system_prompt: System prompt for the GRM. Defaults to
-            ``DEFAULT_GRM_SYSTEM_PROMPT``.
-        prompt: User prompt for the GRM. Defaults to ``DEFAULT_GRM_PROMPT``.
+        user_prompt: User prompt for the GRM. Defaults to
+            ``DEFAULT_GRM_PROMPT``. A ``pkg://`` spec names a zero-argument
+            prompt builder.
 
     Returns:
         dict: ``{"score": float, "genrm_response": str}``.
     """
     from verl.utils.ray_utils import get_event_loop
 
-    from verl_omni.utils.reward_score.reward_utils import pil_image_to_base64, visual_reward_frames
+    from verl_omni.utils.reward_score.reward_utils import (
+        pil_image_to_base64,
+        resolve_prompt_builder,
+        visual_reward_frames,
+    )
 
     solution_image = visual_reward_frames(solution_image, extra_info, extra_info.get("frame_interval", 4))
 
     model_name = model_name or os.path.expanduser(DEFAULT_GRM_MODEL_PATH)
-    system_prompt = DEFAULT_GRM_SYSTEM_PROMPT if system_prompt is None else system_prompt
-    prompt = DEFAULT_GRM_PROMPT if prompt is None else prompt
+    if user_prompt is None:
+        user_prompt = DEFAULT_GRM_PROMPT
+    elif user_prompt.startswith("pkg://"):
+        user_prompt = resolve_prompt_builder(user_prompt)()
     loop = get_event_loop()
 
     grm_response = ""
@@ -153,12 +157,12 @@ async def compute_score_ocr(
         image_base64 = await loop.run_in_executor(None, pil_image_to_base64, pil_image)
 
         messages = [
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": "You are a helpful assistant."},
             {
                 "role": "user",
                 "content": [
                     {"type": "image_url", "image_url": {"url": image_base64}},
-                    {"type": "text", "text": prompt},
+                    {"type": "text", "text": user_prompt},
                 ],
             },
         ]

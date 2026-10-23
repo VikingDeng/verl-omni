@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Two reward terms sharing one judge deployment, each with its own system prompt.
+# Two reward terms sharing one judge deployment, each with its own user prompt.
 #
 # Same recipe as run_sd35_medium_ocr_lora_v1.sh, but the Qwen2.5-VL judge is
 # registered once as `judge` and two genrm_ocr terms point at it:
-#   ocr_default: the scorer's default system prompt
-#   ocr_custom:  a custom system prompt set on the term
+#   ocr_default: the scorer's default user prompt
+#   ocr_custom:  a custom user prompt set on the term
 # Each term is logged as critic/reward/<term>/mean. Set SHARED_JUDGE=0 to run
 # the single-term baseline (one `ocr` term on the same judge) for comparison.
 #
@@ -20,7 +20,7 @@ model_name=${MODEL_PATH:-stabilityai/stable-diffusion-3.5-medium}
 reward_model_name=${REWARD_MODEL_PATH:-Qwen/Qwen2.5-VL-3B-Instruct}
 reward_function_path=verl_omni/utils/reward_score/genrm_ocr.py
 custom_chat_template='{% for message in messages %}{% if message['\''role'\''] == '\''user'\'' %}{{ message['\''content'\''] }}{% endif %}{% endfor %}'
-custom_system_prompt=${CUSTOM_SYSTEM_PROMPT:-"You are an OCR engine. Output only the text that appears in the image, with no extra words."}
+custom_user_prompt=${CUSTOM_USER_PROMPT:-"Read the text in this image and output it exactly, with nothing else."}
 
 NUM_GPUS_ACTOR_ROLLOUT=${NUM_GPUS_ACTOR_ROLLOUT:-1}
 NUM_GPUS_REWARD=${NUM_GPUS_REWARD:-1}
@@ -45,7 +45,7 @@ if [ "$SHARED_JUDGE" = "1" ]; then
         +reward.reward_functions.ocr_custom.weight=0.5
         +reward.reward_functions.ocr_custom.required=True
         +reward.reward_functions.ocr_custom.use_rollout_sampling_params=True
-        "+reward.reward_functions.ocr_custom.system_prompt=\"$custom_system_prompt\""
+        "+reward.reward_functions.ocr_custom.user_prompt=\"$custom_user_prompt\""
     )
 else
     experiment_name=sd35_medium_ocr_single_judge

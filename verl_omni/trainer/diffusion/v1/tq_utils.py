@@ -15,6 +15,8 @@
 import dataclasses
 import logging
 import os
+from collections import Counter
+from collections.abc import Iterable
 from typing import Any, Literal
 
 import numpy as np
@@ -26,6 +28,7 @@ from verl.protocol import DataProto
 from verl.utils import tensordict_utils as tu
 
 from verl_omni.trainer.diffusion.diffusion_trainer_utils import MEDIA_ARTIFACT_FIELD_PREFIX
+from verl_omni.workers.config.diffusion.model import DIFFUSION_TQ_KEYS
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -50,10 +53,8 @@ def diffusion_persisted_tq_fields(
 # Fields consumed by the post-step rollout-dump read. Selecting them
 # explicitly keeps the dump from re-pulling the trainer-only compute payloads
 # (all_latents, prompt_embeds, ...) which dominate row size. Absent optional
-# fields are silently skipped by TransferQueue's field selection:
-# ``sample_level_scores`` is persisted by the colocated-reward trainer before
-# the dump (its preferred scores source), while async-reward rows carry only
-# ``rm_scores`` and keep that fallback.
+# fields are silently skipped by TransferQueue's field selection. The score
+# fields are used when the driver has no sidecar scores for the dump.
 DIFFUSION_DUMP_TQ_FIELDS = (
     "prompts",
     "responses",
@@ -230,6 +231,35 @@ def diffusion_tq_batch_to_dataproto(
     return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 
 
+def _pack_reward_extra_info(data: DataProto, expected_rows: int) -> list[dict[str, Any]] | None:
+    reward_extra_keys = list(data.meta_info.get("reward_extra_keys") or [])
+    existing = data.non_tensor_batch.get("reward_extra_info")
+    if not reward_extra_keys and existing is None:
+        return None
+
+    columns = []
+    for key in reward_extra_keys:
+        if key not in data.non_tensor_batch:
+            raise ValueError(f"reward_extra_info: missing non_tensor_batch column {key!r}")
+        column = data.non_tensor_batch[key]
+        if len(column) != expected_rows:
+            raise ValueError(f"reward_extra_info column {key!r}: expected {expected_rows} rows, got {len(column)}")
+        columns.append(column.tolist())
+
+    if existing is not None and len(existing) != expected_rows:
+        raise ValueError(f"reward_extra_info: expected {expected_rows} rows, got {len(existing)}")
+
+    rows = (
+        [dict(info) if info is not None else {} for info in existing]
+        if existing is not None
+        else [{} for _ in range(expected_rows)]
+    )
+    if reward_extra_keys:
+        for row, values in zip(rows, zip(*columns, strict=True), strict=True):
+            row.update(zip(reward_extra_keys, values, strict=True))
+    return rows
+
+
 def put_dataproto_fields_to_tq(
     batch_meta: KVBatchMeta,
     data: DataProto,
@@ -250,19 +280,12 @@ def put_dataproto_fields_to_tq(
     """
     output: dict[str, Any] = {}
     for field in fields:
-        if field in data.batch:
+        if data.batch is not None and field in data.batch:
             output[field] = data.batch[field]
-        elif field == "reward_extra_info" and (keys := data.meta_info.get("reward_extra_keys")):
-            columns = []
-            expected = len(batch_meta.keys)
-            for key in keys:
-                if key not in data.non_tensor_batch:
-                    raise ValueError(f"reward_extra_info: missing non_tensor_batch column {key!r}")
-                column = data.non_tensor_batch[key]
-                if len(column) != expected:
-                    raise ValueError(f"reward_extra_info column {key!r}: expected {expected} rows, got {len(column)}")
-                columns.append(column.tolist())
-            output[field] = [dict(zip(keys, row, strict=True)) for row in zip(*columns, strict=True)]
+        elif field == "reward_extra_info":
+            reward_extra_info = _pack_reward_extra_info(data, len(batch_meta.keys))
+            if reward_extra_info is not None:
+                output[field] = reward_extra_info
     if not output:
         return
     sort_idx = sort_diffusion_tq_keys(list(batch_meta.keys))
@@ -272,6 +295,127 @@ def put_dataproto_fields_to_tq(
         partition_id=batch_meta.partition_id,
         fields=tu.get_tensordict(output),
     )
+
+
+def _snapshot_diagnostic_value(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().clone()
+    if isinstance(value, np.ndarray):
+        return value.copy()
+    if isinstance(value, dict):
+        return {k: _snapshot_diagnostic_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_snapshot_diagnostic_value(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_snapshot_diagnostic_value(v) for v in value)
+    return value
+
+
+@dataclasses.dataclass(slots=True)
+class _SidecarRow:
+    tensors: dict[str, torch.Tensor]
+    uid: Any | None
+    reward_extra_info: dict[str, Any] | None
+
+
+class DiffusionStepSidecar:
+    """Keep detached metric rows until the driver clears the step's queue keys."""
+
+    def __init__(self) -> None:
+        self._rows: dict[tuple[str, str], _SidecarRow] = {}
+
+    def record(
+        self,
+        batch_meta: KVBatchMeta,
+        data: DataProto,
+        algorithm: Literal["policy_gradient", "direct_preference"],
+    ) -> None:
+        """Retain metric tensors and metadata for the sampled queue rows."""
+        n_keys = len(batch_meta.keys)
+        if n_keys == 0:
+            return
+        data_rows = data[:n_keys] if len(data) > n_keys else data
+        if len(data_rows) != n_keys:
+            raise ValueError(f"Diffusion step sidecar expected {n_keys} rows, got {len(data_rows)}")
+
+        if DIFFUSION_TQ_KEYS in data_rows.non_tensor_batch:
+            keys = [str(key) for key in data_rows.non_tensor_batch[DIFFUSION_TQ_KEYS].tolist()]
+            if Counter(keys) != Counter(batch_meta.keys):
+                raise ValueError("Diffusion step sidecar row keys do not match the sampled queue keys")
+        else:
+            keys = [batch_meta.keys[i] for i in sort_diffusion_tq_keys(list(batch_meta.keys))]
+
+        batch = data_rows.batch
+        fields = (
+            {
+                name: batch[name]
+                for name in diffusion_persisted_tq_fields(algorithm)
+                if name != "reward_extra_info" and name in batch
+            }
+            if batch is not None
+            else {}
+        )
+        uids = data_rows.non_tensor_batch.get("uid")
+        reward_extra_info = _pack_reward_extra_info(data_rows, n_keys)
+        self._rows.update(
+            {
+                (batch_meta.partition_id, key): _SidecarRow(
+                    tensors={name: tensor[i].detach().cpu().clone() for name, tensor in fields.items()},
+                    uid=uids[i] if uids is not None else None,
+                    reward_extra_info=(
+                        _snapshot_diagnostic_value(reward_extra_info[i]) if reward_extra_info is not None else None
+                    ),
+                )
+                for i, key in enumerate(keys)
+            }
+        )
+
+    def build_metrics_dataproto(self, batch_meta: KVBatchMeta) -> DataProto | None:
+        """Assemble complete metric rows in canonical queue key order."""
+        keys = [(batch_meta.partition_id, key) for key in batch_meta.keys]
+        if not keys or any(
+            key not in self._rows or "sample_level_rewards" not in self._rows[key].tensors for key in keys
+        ):
+            return None
+
+        rows = [self._rows[keys[i]] for i in sort_diffusion_tq_keys(list(batch_meta.keys))]
+        tensors = {}
+        for name in rows[0].tensors:
+            if all(name in row.tensors for row in rows):
+                values = [row.tensors[name] for row in rows]
+                tensors[name] = torch.stack(values) if values[0].ndim == 0 else _stack_field(values)
+
+        non_tensors = {}
+        if any(row.uid is not None for row in rows):
+            non_tensors["uid"] = np.fromiter((row.uid for row in rows), dtype=object, count=len(rows))
+        if any(row.reward_extra_info is not None for row in rows):
+            non_tensors["reward_extra_info"] = np.fromiter(
+                (dict(row.reward_extra_info) if row.reward_extra_info is not None else None for row in rows),
+                dtype=object,
+                count=len(rows),
+            )
+        return DataProto.from_dict(tensors=tensors, non_tensors=non_tensors)
+
+    def get_sample_level_scores(self, batch_meta: KVBatchMeta) -> list[float] | None:
+        """Return all row scores in the requested key order when available."""
+        keys = [(batch_meta.partition_id, key) for key in batch_meta.keys]
+        if not keys or any(
+            key not in self._rows or "sample_level_scores" not in self._rows[key].tensors for key in keys
+        ):
+            return None
+        return [float(self._rows[key].tensors["sample_level_scores"].sum().item()) for key in keys]
+
+    def evict(self, partition_id: str, keys: Iterable[str]) -> None:
+        """Discard metric rows after their queue rows are cleared."""
+        for key in keys:
+            self._rows.pop((partition_id, key), None)
+
+    def clear(self) -> None:
+        """Discard every retained metric row."""
+        self._rows.clear()
+
+    def __len__(self) -> int:
+        return len(self._rows)
 
 
 def sort_diffusion_tq_keys(keys: list[str]) -> list[int]:

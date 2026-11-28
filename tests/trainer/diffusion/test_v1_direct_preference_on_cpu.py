@@ -98,16 +98,6 @@ def test_dpo_train_step_skips_old_log_prob_and_pairs_batch(monkeypatch):
         "verl_omni.trainer.diffusion.v1.trainer_base.extract_reward",
         lambda batch: (batch.batch["rm_scores"], {}),
     )
-    tq_writes: list[list[str]] = []
-
-    def capture_tq(batch_meta, batch, fields):
-        del batch_meta, batch
-        tq_writes.append(list(fields))
-
-    monkeypatch.setattr(
-        "verl_omni.trainer.diffusion.v1.trainer_base.put_dataproto_fields_to_tq",
-        capture_tq,
-    )
 
     def fail_old_log_prob(_data):
         raise AssertionError("DPO must not recompute old_log_probs")
@@ -140,8 +130,10 @@ def test_dpo_train_step_skips_old_log_prob_and_pairs_batch(monkeypatch):
     result = trainer._train_sampled_batch({}, {}, batch_meta)
 
     assert result is batch_meta
-    assert "old_log_probs" not in tq_writes[0]
-    assert "sample_level_scores" in tq_writes[0]
+    step_metrics_data = trainer._step_sidecar.build_metrics_dataproto(batch_meta)
+    assert step_metrics_data is not None
+    assert "old_log_probs" not in step_metrics_data.batch
+    torch.testing.assert_close(step_metrics_data.batch["sample_level_scores"], data.batch["rm_scores"])
     paired = captured["update"]
     assert len(paired) == 4
     assert list(paired.non_tensor_batch["uid"]) == ["p0", "p0", "p1", "p1"]

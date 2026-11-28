@@ -159,8 +159,8 @@ def test_nft_tq_rows_and_old_policy_schedule(monkeypatch, step, refresh):
     assert (sent.batch["reward_prob"][[1, 2]] < 0.5).all()
     assert "old_log_probs" not in sent.batch
     assert "ref_noise_pred" not in sent.batch
-    assert write.call_args.kwargs["keys"] == sorted_keys
-    torch.testing.assert_close(write.call_args.kwargs["fields"]["sample_level_scores"], sorted_rewards)
+    write.assert_not_called()
+    assert trainer._step_sidecar.get_sample_level_scores(meta) == pytest.approx(rewards.squeeze(-1).tolist())
     assert metrics["old_policy/update_applied"] == float(refresh is not None)
     assert events == ["actor", *([refresh] if refresh else []), "sync"]
     if refresh == "copy":

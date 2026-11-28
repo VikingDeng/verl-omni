@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Benchmark full and metrics-only reads through a real TransferQueue."""
+"""Benchmark TransferQueue field projection and driver-local post-step metrics."""
 
 import argparse
 import importlib.metadata
@@ -22,13 +22,21 @@ import platform
 import statistics
 import time
 
+import numpy as np
 import ray
 import torch
 import transfer_queue as tq
 from omegaconf import OmegaConf
 from tensordict import NonTensorStack, TensorDict
+from verl.protocol import DataProto
 
-from verl_omni.trainer.diffusion.v1.tq_utils import diffusion_metric_tq_fields, diffusion_tq_batch_to_dataproto
+from verl_omni.trainer.diffusion.v1.tq_utils import (
+    DiffusionStepSidecar,
+    diffusion_metric_tq_fields,
+    diffusion_persisted_tq_fields,
+    diffusion_tq_batch_to_dataproto,
+    put_dataproto_fields_to_tq,
+)
 from verl_omni.workers.config.diffusion.model import DIFFUSION_TQ_DRIVER_FIELDS
 
 
@@ -137,7 +145,7 @@ def main() -> None:
     parser.add_argument("--resolution", type=int, default=384)
     parser.add_argument("--steps", type=int, default=10)
     parser.add_argument("--prompt-tokens", type=int)
-    parser.add_argument("--read-mode", choices=["metrics", "training"], default="metrics")
+    parser.add_argument("--read-mode", choices=["metrics", "training", "sidecar"], default="metrics")
     parser.add_argument("--height", type=int, default=704)
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--frames", type=int, default=9)
@@ -150,10 +158,12 @@ def main() -> None:
         "--algorithm",
         choices=["policy_gradient", "direct_preference"],
         default="policy_gradient",
-        help="Match the metric fields persisted by the selected trainer path.",
+        help="Match the metric fields produced by the selected trainer path.",
     )
     args = parser.parse_args()
     training = args.read_mode == "training"
+    sidecar = DiffusionStepSidecar() if args.read_mode == "sidecar" else None
+    candidate_name = "sidecar" if sidecar is not None else "projected"
     if args.prompt_tokens is None:
         args.prompt_tokens = 1024 if training else 333
     if args.iterations < 1 or args.warmup < 0:
@@ -196,6 +206,17 @@ def main() -> None:
         if training
         else _make_sd35_payload(args.batch_size, args.resolution, args.steps, args.prompt_tokens, args.algorithm)
     )
+    if sidecar is not None:
+        persisted_fields = diffusion_persisted_tq_fields(args.algorithm)
+        step_tensors = {field: payload[field] for field in persisted_fields if field in payload}
+        if args.algorithm == "direct_preference":
+            step_tensors["sample_level_rewards"] = step_tensors["sample_level_scores"]
+        step_data = DataProto.from_dict(
+            tensors=step_tensors,
+            non_tensors={"uid": payload["uid"], "ocr": np.arange(args.batch_size, dtype=np.float32) % 2},
+            meta_info={"reward_extra_keys": ["ocr"]},
+        )
+        payload = payload.exclude(*step_tensors, "extra_fields")
     tags = [
         {
             "status": "success",
@@ -204,18 +225,30 @@ def main() -> None:
         for _ in keys
     ]
     try:
-        batch_meta = tq.kv_batch_put(keys=keys, partition_id="benchmark", fields=payload, tags=tags)
         projected_fields = list(DIFFUSION_TQ_DRIVER_FIELDS) if training else diffusion_metric_tq_fields(args.algorithm)
-        variants = [("baseline", None), ("projected", projected_fields)]
+        variants = [("baseline", None), (candidate_name, projected_fields)]
         samples = {name: [] for name, _ in variants}
         tensor_bytes = {}
         checksums = {}
         returned_fields = {}
         for round_idx in range(args.warmup + args.iterations):
+            if round_idx == 0 or sidecar is not None:
+                batch_meta = tq.kv_batch_put(keys=keys, partition_id="benchmark", fields=payload, tags=tags)
             order = variants if round_idx % 2 == 0 else list(reversed(variants))
+            metrics_batches = {}
             for name, select_fields in order:
                 started = time.perf_counter_ns()
-                if training:
+                if sidecar is not None:
+                    if name == "baseline":
+                        put_dataproto_fields_to_tq(batch_meta, step_data, persisted_fields)
+                        metrics_data = diffusion_tq_batch_to_dataproto(batch_meta, select_fields=projected_fields)
+                    else:
+                        sidecar.record(batch_meta, step_data, args.algorithm)
+                        metrics_data = sidecar.build_metrics_dataproto(batch_meta)
+                        if metrics_data is None:
+                            raise RuntimeError("The sidecar is missing the recorded metric rows")
+                    data = metrics_data.batch
+                elif training:
                     data = diffusion_tq_batch_to_dataproto(batch_meta, select_fields=select_fields).batch
                 else:
                     data = tq.kv_batch_get(
@@ -225,15 +258,26 @@ def main() -> None:
                 if not training:
                     checksums[name] = float(data["sample_level_rewards"][0, 0])
                 tensor_bytes[name] = _tensor_nbytes(data)
-                returned_fields[name] = sorted(data.keys())
+                if sidecar is not None:
+                    metrics_batches[name] = metrics_data
+                    returned_fields[name] = sorted([*data.keys(), *metrics_data.non_tensor_batch])
+                else:
+                    returned_fields[name] = sorted(data.keys())
                 if round_idx >= args.warmup:
                     samples[name].append(elapsed_ms)
+            if sidecar is not None:
+                baseline = metrics_batches["baseline"]
+                candidate = metrics_batches["sidecar"]
+                torch.testing.assert_close(dict(baseline.batch.items()), dict(candidate.batch.items()), rtol=0, atol=0)
+                np.testing.assert_equal(baseline.non_tensor_batch, candidate.non_tensor_batch)
+                sidecar.evict(batch_meta.partition_id, batch_meta.keys)
+                tq.kv_clear(keys=batch_meta.keys, partition_id=batch_meta.partition_id)
     finally:
         tq.close()
         ray.shutdown()
 
     baseline_median = statistics.median(samples["baseline"])
-    projected_median = statistics.median(samples["projected"])
+    candidate_median = statistics.median(samples[candidate_name])
     result = {
         "environment": {
             "platform": platform.platform(),
@@ -262,11 +306,20 @@ def main() -> None:
         "selected_fields": projected_fields,
         "returned_fields": returned_fields,
         "returned_tensor_bytes": tensor_bytes,
-        "tensor_byte_reduction_ratio": 1 - tensor_bytes["projected"] / tensor_bytes["baseline"],
+        "tensor_byte_reduction_ratio": 1 - tensor_bytes[candidate_name] / tensor_bytes["baseline"],
         "latency": {name: _summarize(values) for name, values in samples.items()},
-        "median_speedup": baseline_median / projected_median,
+        "median_speedup": baseline_median / candidate_median,
         "limits": "Synthetic single-host TQ driver reads. Tensor bytes exclude metadata and wire headers.",
     }
+    if sidecar is not None:
+        result["transfer_queue_tensor_bytes"] = {
+            "baseline": {"put": _tensor_nbytes(step_data.batch), "get": tensor_bytes["baseline"]},
+            "sidecar": {"put": 0, "get": 0},
+        }
+        result["limits"] = (
+            "Synthetic single-host post-step work. Baseline times the TQ write and projected metrics read. "
+            "Sidecar times local record and metrics batch assembly. Tensor bytes exclude metadata and wire headers."
+        )
     if checksums:
         result["checksums"] = checksums
     print(json.dumps(result, indent=2, sort_keys=True))

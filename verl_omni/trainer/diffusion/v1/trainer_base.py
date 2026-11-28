@@ -24,6 +24,7 @@ from dataclasses import replace
 from functools import cached_property
 from numbers import Integral
 from pprint import pprint
+from typing import Literal
 
 import numpy as np
 import ray
@@ -99,12 +100,11 @@ from verl_omni.trainer.diffusion.rollout_correction import (
 from verl_omni.trainer.diffusion.teacher_manager import DiffusionTeacherManager
 from verl_omni.trainer.diffusion.training_watchdog import TrainingWatchdog
 from verl_omni.trainer.diffusion.v1.tq_utils import (
+    DiffusionStepSidecar,
     canonicalize_diffusion_tq_meta,
     diffusion_dump_tq_fields,
     diffusion_metric_tq_fields,
-    diffusion_persisted_tq_fields,
     diffusion_tq_batch_to_dataproto,
-    put_dataproto_fields_to_tq,
     sort_diffusion_tq_keys,
 )
 from verl_omni.utils.config import resolve_lora_config
@@ -235,6 +235,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         self._teacher_one_step_off = self.use_teacher_policy and self.distillation_config.scheduler == "one_step_off"
         self._pending_teacher_batch = None
         self.replay_buffer = self._build_replay_buffer()
+        self._step_sidecar = DiffusionStepSidecar()
 
         # ref_in_actor: reference policy is the actor without lora applied.
         self.ref_in_actor = resolve_lora_config(config.actor_rollout_ref.model).enabled
@@ -539,6 +540,9 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                     self._log_rollout_data(batch, self.timing_raw, rollout_data_dir)
 
                 tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
+                sidecar = getattr(self, "_step_sidecar", None)
+                if sidecar is not None:
+                    sidecar.evict(batch.partition_id, batch.keys)
 
                 self.logger.log(data=metrics, step=self.global_steps)
                 progress_bar.update(1)
@@ -555,6 +559,9 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             self._shutdown_dump_executor()
             self._shutdown_dataloaders()
         finally:
+            sidecar = getattr(self, "_step_sidecar", None)
+            if sidecar is not None:
+                sidecar.clear()
             self._cleanup_active_profiling()
 
     def _report_training_watchdog(self, metrics: dict) -> None:
@@ -683,6 +690,16 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         data = self._read_training_batch(batch_meta)
         return batch_meta, data, self.teacher_model_manager.dispatch_prev_sample_mean(data)
 
+    def _record_step_sidecar(
+        self,
+        batch_meta: KVBatchMeta,
+        data: DataProto,
+        algorithm: Literal["policy_gradient", "direct_preference"],
+    ) -> None:
+        if getattr(self, "_step_sidecar", None) is None:
+            self._step_sidecar = DiffusionStepSidecar()
+        self._step_sidecar.record(batch_meta, data, algorithm)
+
     def _train_sampled_batch(
         self,
         metrics: dict,
@@ -762,19 +779,8 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             actor_metrics = reduce_metrics(actor_output.meta_info["metrics"])
             metrics.update(actor_metrics)
 
-        # Persist computed fields back to TransferQueue so the sampled keys carry
-        # the full trajectory for metrics/dumping (keys are cleared after step).
-        # Slice to the original key count in case ``_balance_batch`` appended pad rows.
         n_keys = len(batch_meta.keys)
-        if len(data) > n_keys:
-            data_for_tq = data.select_idxs(list(range(n_keys)))
-        else:
-            data_for_tq = data
-        put_dataproto_fields_to_tq(
-            batch_meta,
-            data_for_tq,
-            fields=diffusion_persisted_tq_fields("policy_gradient"),
-        )
+        self._record_step_sidecar(batch_meta, data[:n_keys] if len(data) > n_keys else data, "policy_gradient")
         return batch_meta
 
     def _validate_old_adapter_config(self):
@@ -871,14 +877,13 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             data.batch["sample_level_scores"] = reward_tensor
             if reward_extra_infos_dict:
                 data.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
-            # Persist unpaired scores for metrics before pairing shrinks the batch.
+            # Metrics cover every sampled row, including those omitted by pairing.
             data.batch["sample_level_rewards"] = data.batch["sample_level_scores"]
             n_keys = len(batch_meta.keys)
-            data_for_tq = data.select_idxs(list(range(n_keys))) if len(data) > n_keys else data
-            put_dataproto_fields_to_tq(
+            self._record_step_sidecar(
                 batch_meta,
-                data_for_tq,
-                fields=diffusion_persisted_tq_fields("direct_preference"),
+                data[:n_keys] if len(data) > n_keys else data,
+                "direct_preference",
             )
             data = self._prepare_actor_batch(data, reward_tensor)
             data.batch["sample_level_rewards"] = data.batch["sample_level_scores"]
@@ -1912,26 +1917,28 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         self._dump_futures.append((future, global_step))
 
     def _log_rollout_data(self, batch_meta: KVBatchMeta, timing_raw: dict, rollout_data_dir: str):
-        """Fetch rollout rows from TQ and dump sorted by uid.
-
-        Reads only the dump's fields; the trainer-only latents/embeds stay in
-        TransferQueue instead of crossing the wire a second time.
-        """
+        """Dump projected rollout rows with their per-sample scores."""
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
+            sidecar = getattr(self, "_step_sidecar", None)
+            sidecar_scores = sidecar.get_sample_level_scores(batch_meta) if sidecar is not None else None
+            select_fields = diffusion_dump_tq_fields(batch_meta)
+            if sidecar_scores is not None:
+                select_fields = [field for field in select_fields if field not in {"sample_level_scores", "rm_scores"}]
             data = diffusion_tq_batch_to_dataproto(
                 batch_meta,
                 pad_token_id=self.tokenizer.pad_token_id or 0,
-                select_fields=diffusion_dump_tq_fields(batch_meta),
+                select_fields=select_fields,
             )
             inputs = self.tokenizer.batch_decode(data.batch["prompts"], skip_special_tokens=True)
             outputs = data.batch["responses"]
-            scores = (
-                data.batch["sample_level_scores"].sum(-1).cpu().tolist()
-                if "sample_level_scores" in data.batch
-                else (
-                    data.batch["rm_scores"].sum(-1).cpu().tolist() if "rm_scores" in data.batch else [0.0] * len(data)
-                )
-            )
+            if sidecar_scores is not None:
+                scores = sidecar_scores
+            elif "sample_level_scores" in data.batch:
+                scores = data.batch["sample_level_scores"].sum(-1).cpu().tolist()
+            elif "rm_scores" in data.batch:
+                scores = data.batch["rm_scores"].sum(-1).cpu().tolist()
+            else:
+                scores = [0.0] * len(data)
             rm_meta = data.non_tensor_batch.get("reward_model")
             gts = (
                 [item.get("ground_truth", None) for item in rm_meta.tolist()]
@@ -1945,15 +1952,17 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             previews = previews_from_batch(data)
 
             sort_idx = sort_diffusion_tq_keys(list(batch_meta.keys))
-            if previews is not None:
-                previews = [previews[i] for i in sort_idx]
-            inputs = [inputs[i] for i in sort_idx]
-            outputs = outputs[torch.tensor(sort_idx)]
-            gts = [gts[i] for i in sort_idx]
+            if sidecar_scores is None:
+                if previews is not None:
+                    previews = [previews[i] for i in sort_idx]
+                inputs = [inputs[i] for i in sort_idx]
+                outputs = outputs[torch.tensor(sort_idx)]
+                gts = [gts[i] for i in sort_idx]
+                audios = [audios[i] for i in sort_idx]
+                audio_sample_rates = [audio_sample_rates[i] for i in sort_idx]
+                media_kinds = [media_kinds[i] for i in sort_idx]
+            # The converter orders rollout rows canonically, while sidecar scores follow batch_meta.keys.
             scores = [scores[i] for i in sort_idx]
-            audios = [audios[i] for i in sort_idx]
-            audio_sample_rates = [audio_sample_rates[i] for i in sort_idx]
-            media_kinds = [media_kinds[i] for i in sort_idx]
             reward_extra_infos_dict = {"uid": [batch_meta.keys[i] for i in sort_idx]}
             self._dump_generations(
                 inputs=inputs,
@@ -1995,13 +2004,16 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         return metric_dict
 
     def _compute_metrics(self, batch_meta: KVBatchMeta, metrics, timing_raw, global_steps, epoch):
-        data = diffusion_tq_batch_to_dataproto(
-            batch_meta,
-            pad_token_id=self.tokenizer.pad_token_id or 0,
-            select_fields=diffusion_metric_tq_fields(
-                "direct_preference" if self._is_direct_preference else "policy_gradient"
-            ),
-        )
+        sidecar = getattr(self, "_step_sidecar", None)
+        data = sidecar.build_metrics_dataproto(batch_meta) if sidecar is not None else None
+        if data is None:
+            data = diffusion_tq_batch_to_dataproto(
+                batch_meta,
+                pad_token_id=self.tokenizer.pad_token_id or 0,
+                select_fields=diffusion_metric_tq_fields(
+                    "direct_preference" if self._is_direct_preference else "policy_gradient"
+                ),
+            )
         metrics.update({"training/global_step": global_steps, "training/epoch": epoch})
         metrics.update(compute_data_metrics_diffusion(batch=data))
         n_gpus = self._get_n_gpus_for_throughput()

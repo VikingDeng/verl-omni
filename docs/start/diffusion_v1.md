@@ -1,6 +1,6 @@
 # Diffusion V1 training
 
-Last updated: 11/03/2026
+Last updated: 11/28/2026
 
 This guide runs the diffusion V1 trainer in synchronous or separate-asynchronous
 mode using the provided Stable Diffusion 3.5 Medium FlowGRPO OCR recipes.
@@ -36,18 +36,21 @@ is pending.
 Reward workers called by the agent loop receive the prompt and generated output;
 their score returns to the agent loop and is stored with the trajectory row. An
 optional colocated reward scorer runs trainer-side after the row is read. The
-trainer then writes selected score, advantage, and return fields back to that
-same queue row. ReplayBuffer samples and groups queue rows for actor training;
-the trainer computes configured advantages and diffusion loss, then updates the
-actor policy.
+trainer keeps computed scores, rewards, advantages, returns, and reward
+diagnostics in a driver-local sidecar keyed by TransferQueue row. Metrics read
+these values from the sidecar, and rollout dumps combine its scores with a
+field-projected queue read. ReplayBuffer samples and groups queue rows for actor
+training. The trainer computes configured advantages and diffusion loss, then
+updates the actor policy.
 
 The main implementation points are `main_diffusion_v1.py`,
 `agent_loop/diffusion_agent_loop_tq.py::_write_trajectories_to_tq`,
 `trainer/diffusion/v1/trainer_base.py::_train_sampled_batch`, and
-`trainer/diffusion/v1/tq_utils.py::put_dataproto_fields_to_tq`. The trainer's
+`trainer/diffusion/v1/tq_utils.py::DiffusionStepSidecar`. The trainer's
 checkpoint manager handles actor/dataloader checkpoints and rollout weight
-sync; separate-async checkpoints can also snapshot TransferQueue state. Training
-rows are cleared after metric and rollout-dump handling.
+sync. Separate-async checkpoints can also snapshot TransferQueue state. The
+trainer clears queue rows and their sidecar entries after metric and rollout-dump
+handling.
 
 In `sync`, rollout and actor workers are colocated, and each training step waits
 for a complete rollout batch before updating the actor and refreshing rollout

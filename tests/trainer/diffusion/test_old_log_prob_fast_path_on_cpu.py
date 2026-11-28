@@ -162,10 +162,6 @@ class TestV1TrainerSkipBranch:
             "verl_omni.trainer.diffusion.v1.trainer_base.extract_reward",
             lambda batch: (batch.batch["rm_scores"], {}),
         )
-        monkeypatch.setattr(
-            "verl_omni.trainer.diffusion.v1.trainer_base.put_dataproto_fields_to_tq",
-            lambda batch_meta, batch, fields: None,
-        )
         captured = {}
 
         def capture_update(batch):
@@ -186,4 +182,8 @@ class TestV1TrainerSkipBranch:
         assert "old_log_probs" not in updated
         assert "teacher_prev_sample_mean" in updated
         assert updated["advantages"].shape == (4, 2)
+        step_metrics_data = trainer._step_sidecar.build_metrics_dataproto(batch_meta)
+        assert step_metrics_data is not None
+        assert "old_log_probs" not in step_metrics_data.batch
+        torch.testing.assert_close(step_metrics_data.batch["advantages"], updated["advantages"])
         assert metrics["actor/distill_kl_loss"] == 0.1
